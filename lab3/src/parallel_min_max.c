@@ -5,12 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-
 #include <getopt.h>
+#include <fcntl.h>
+#include <dirent.h>
 
 #include "find_min_max.h"
 #include "utils.h"
@@ -40,24 +40,30 @@ int main(int argc, char **argv) {
         switch (option_index) {
           case 0:
             seed = atoi(optarg);
-            // your code here
-            // error handling
+            if (seed <= 0) {
+                printf("seed must be a positive number\n");
+                return 1;
+            }
             break;
           case 1:
             array_size = atoi(optarg);
-            // your code here
-            // error handling
+            if (array_size <= 0) {
+                printf("array_size must be a positive number\n");
+                return 1;
+            }
             break;
           case 2:
             pnum = atoi(optarg);
-            // your code here
-            // error handling
+            if (pnum <= 0) {
+                printf("pnum must be a positive number\n");
+                return 1;
+            }
             break;
           case 3:
             with_files = true;
             break;
 
-          defalut:
+          default:
             printf("Index %d is out of options\n", option_index);
         }
         break;
@@ -88,8 +94,30 @@ int main(int argc, char **argv) {
   GenerateArray(array, array_size, seed);
   int active_child_processes = 0;
 
+  // Массив для хранения PID дочерних процессов (нужен для файловой версии)
+  pid_t *child_pids = NULL;
+  if (with_files) {
+    child_pids = malloc(pnum * sizeof(pid_t));
+  }
+
+  // Create pipes for communication (if not using files)
+  int (*pipes)[2] = NULL;
+  if (!with_files) {
+    pipes = malloc(pnum * sizeof(int[2]));
+    for (int i = 0; i < pnum; i++) {
+      if (pipe(pipes[i]) == -1) {
+        printf("Pipe creation failed!\n");
+        return 1;
+      }
+    }
+  }
+
   struct timeval start_time;
   gettimeofday(&start_time, NULL);
+
+  // Calculate chunk size for each process
+  int chunk_size = array_size / pnum;
+  int remainder = array_size % pnum;
 
   for (int i = 0; i < pnum; i++) {
     pid_t child_pid = fork();
@@ -98,15 +126,46 @@ int main(int argc, char **argv) {
       active_child_processes += 1;
       if (child_pid == 0) {
         // child process
+        
+        // Calculate start and end indices for this chunk
+        int start = i * chunk_size;
+        int end = start + chunk_size;
+        
+        // Handle remainder for the last process
+        if (i == pnum - 1 && remainder > 0) {
+          end += remainder;
+        }
 
-        // parallel somehow
+        struct MinMax local_min_max = GetMinMax(array, start, end);
 
         if (with_files) {
-          // use files here
+          char filename[100];
+          sprintf(filename, "minmax_%d.txt", getpid());
+          
+          FILE *file = fopen(filename, "w");
+          if (file != NULL) {
+            fprintf(file, "%d\n%d", local_min_max.min, local_min_max.max);
+            fclose(file);
+          }
         } else {
-          // use pipe here
+          // Use pipe for communication
+          close(pipes[i][0]); 
+          
+          write(pipes[i][1], &local_min_max.min, sizeof(int));
+          write(pipes[i][1], &local_min_max.max, sizeof(int));
+          
+          close(pipes[i][1]); 
         }
-        return 0;
+        
+        free(array);
+        if (with_files) free(child_pids);
+        if (!with_files) free(pipes);
+        exit(0);
+      } else {
+        // Store child PID for file version
+        if (with_files) {
+          child_pids[i] = child_pid;
+        }
       }
 
     } else {
@@ -115,9 +174,9 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Parent process - wait for all children to complete
   while (active_child_processes > 0) {
-    // your code here
-
+    wait(NULL);
     active_child_processes -= 1;
   }
 
@@ -130,13 +189,39 @@ int main(int argc, char **argv) {
     int max = INT_MIN;
 
     if (with_files) {
-      // read from files
+      // Read from files created by child processes
+      char filename[100];
+      sprintf(filename, "minmax_%d.txt", child_pids[i]);
+      
+      FILE *file = fopen(filename, "r");
+      if (file != NULL) {
+        if (fscanf(file, "%d", &min) != 1) min = INT_MAX;
+        if (fscanf(file, "%d", &max) != 1) max = INT_MIN;
+        fclose(file);
+        // Remove temporary file
+        //remove(filename);
+      } else {
+        printf("Warning: Could not open file %s\n", filename);
+      }
     } else {
-      // read from pipes
+      // Read from pipes
+      close(pipes[i][1]); 
+      
+      if (read(pipes[i][0], &min, sizeof(int)) != sizeof(int)) min = INT_MAX;
+      if (read(pipes[i][0], &max, sizeof(int)) != sizeof(int)) max = INT_MIN;
+      
+      close(pipes[i][0]); 
     }
 
     if (min < min_max.min) min_max.min = min;
     if (max > min_max.max) min_max.max = max;
+  }
+
+  // Free allocated memory
+  if (with_files) {
+    free(child_pids);
+  } else {
+    free(pipes);
   }
 
   struct timeval finish_time;
