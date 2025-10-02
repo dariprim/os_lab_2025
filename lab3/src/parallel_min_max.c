@@ -11,6 +11,8 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <signal.h>
+#include <errno.h>
 
 #include "find_min_max.h"
 #include "utils.h"
@@ -19,6 +21,7 @@ int main(int argc, char **argv) {
   int seed = -1;
   int array_size = -1;
   int pnum = -1;
+  int timeout = -1;  // Таймаут в секундах
   bool with_files = false;
 
   while (true) {
@@ -27,6 +30,7 @@ int main(int argc, char **argv) {
     static struct option options[] = {{"seed", required_argument, 0, 0},
                                       {"array_size", required_argument, 0, 0},
                                       {"pnum", required_argument, 0, 0},
+                                      {"timeout", required_argument, 0, 0},
                                       {"by_files", no_argument, 0, 'f'},
                                       {0, 0, 0, 0}};
 
@@ -60,6 +64,13 @@ int main(int argc, char **argv) {
             }
             break;
           case 3:
+            timeout = atoi(optarg);
+            if (timeout <= 0) {
+                printf("timeout must be a positive number\n");
+                return 1;
+            }
+            break;
+          case 4:
             with_files = true;
             break;
 
@@ -85,7 +96,7 @@ int main(int argc, char **argv) {
   }
 
   if (seed == -1 || array_size == -1 || pnum == -1) {
-    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" \n",
+    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" [--timeout \"num\"] \n",
            argv[0]);
     return 1;
   }
@@ -94,11 +105,8 @@ int main(int argc, char **argv) {
   GenerateArray(array, array_size, seed);
   int active_child_processes = 0;
 
-  // Массив для хранения PID дочерних процессов (нужен для файловой версии)
-  pid_t *child_pids = NULL;
-  if (with_files) {
-    child_pids = malloc(pnum * sizeof(pid_t));
-  }
+  // Массив для хранения PID дочерних процессов
+  pid_t *child_pids = malloc(pnum * sizeof(pid_t));
 
   // Create pipes for communication (if not using files)
   int (*pipes)[2] = NULL;
@@ -158,14 +166,12 @@ int main(int argc, char **argv) {
         }
         
         free(array);
-        if (with_files) free(child_pids);
+        free(child_pids);
         if (!with_files) free(pipes);
         exit(0);
       } else {
-        // Store child PID for file version
-        if (with_files) {
-          child_pids[i] = child_pid;
-        }
+        // Store child PID
+        child_pids[i] = child_pid;
       }
 
     } else {
@@ -174,7 +180,62 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Parent process - wait for all children to complete
+  // Parent process - wait for all children to complete with timeout
+  if (timeout > 0) {
+    // Используем select для ожидания с таймаутом
+    struct timeval tv;
+    tv.tv_sec = timeout;
+    tv.tv_usec = 0;
+
+    fd_set fds;
+    FD_ZERO(&fds);
+    
+    int max_fd = 0;
+    if (!with_files) {
+      for (int i = 0; i < pnum; i++) {
+        FD_SET(pipes[i][0], &fds);
+        if (pipes[i][0] > max_fd) max_fd = pipes[i][0];
+      }
+    }
+
+    int ready = select(max_fd + 1, &fds, NULL, NULL, &tv);
+    
+    if (ready == 0) {
+      // Таймаут истек - убиваем все дочерние процессы
+      printf("Timeout reached (%d seconds). Killing child processes...\n", timeout);
+      for (int i = 0; i < pnum; i++) {
+        if (kill(child_pids[i], SIGKILL) == 0) {
+          printf("Killed child process %d\n", child_pids[i]);
+        } else {
+          printf("Failed to kill child process %d: %s\n", child_pids[i], strerror(errno));
+        }
+      }
+      
+      // Ждем завершения убитых процессов
+      while (active_child_processes > 0) {
+        wait(NULL);
+        active_child_processes -= 1;
+      }
+      
+      printf("Min: N/A (timeout)\n");
+      printf("Max: N/A (timeout)\n");
+      
+      struct timeval finish_time;
+      gettimeofday(&finish_time, NULL);
+      double elapsed_time = (finish_time.tv_sec - start_time.tv_sec) * 1000.0;
+      elapsed_time += (finish_time.tv_usec - start_time.tv_usec) / 1000.0;
+      printf("Elapsed time: %fms\n", elapsed_time);
+      
+      // Очистка ресурсов
+      free(array);
+      free(child_pids);
+      if (!with_files) free(pipes);
+      
+      return 0;
+    }
+  }
+
+  // Ожидаем завершения всех дочерних процессов (обычный случай без таймаута)
   while (active_child_processes > 0) {
     wait(NULL);
     active_child_processes -= 1;
@@ -199,7 +260,7 @@ int main(int argc, char **argv) {
         if (fscanf(file, "%d", &max) != 1) max = INT_MIN;
         fclose(file);
         // Remove temporary file
-        //remove(filename);
+        remove(filename);
       } else {
         printf("Warning: Could not open file %s\n", filename);
       }
@@ -218,9 +279,8 @@ int main(int argc, char **argv) {
   }
 
   // Free allocated memory
-  if (with_files) {
-    free(child_pids);
-  } else {
+  free(child_pids);
+  if (!with_files) {
     free(pipes);
   }
 
